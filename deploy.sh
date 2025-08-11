@@ -17,6 +17,9 @@ BIN_MC_REMOTE=""
 BIN_DIR=""
 SSH_OPTS=${SSH_OPTS:-}
 
+BIN_BW_LOCAL="" # we set these later.
+BIN_BW_REMOTE=""
+
 usage() {
   cat <<EOF
 Usage: $0 --host <user@ip> [options]
@@ -64,6 +67,7 @@ done
 BIN_DIR="$PREFIX/bin"
 BIN_JW_REMOTE="$BIN_DIR/jack-watcher"
 BIN_MC_REMOTE="$BIN_DIR/musicctl"
+BIN_BW_REMOTE="$BIN_DIR/btn-watcher"
 WRAPPER_REMOTE="$BIN_DIR/jack-watcher-run"
 UNIT_PATH="/etc/systemd/system/jack-watcher.service"
 COMPAT_SYMLINK="/storage/musicctl.sh"
@@ -96,6 +100,8 @@ fi
 echo "   build target: $TARGET"
 
 BIN_JW_LOCAL="target/$TARGET/release/jack-watcher"
+BIN_BW_LOCAL="target/$TARGET/release/btn-watcher"
+
 
 if [ "$SKIP_BUILD" -eq 0 ]; then
   echo ">> Building jack-watcher…"
@@ -115,9 +121,50 @@ fi
 echo ">> Creating install dirs on device ($BIN_DIR)…"
 do_ssh "mkdir -p '$BIN_DIR'"
 
-echo '>> Copying binaries…'
-do_scp "$BIN_JW_LOCAL" "$BIN_JW_REMOTE"
-do_scp "$BIN_MC_LOCAL" "$BIN_MC_REMOTE"
+echo ">> Stopping running watcher (if any)…"
+do_ssh 'sh -c "
+  set -e
+  if command -v systemctl >/dev/null 2>&1; then
+    # Don’t block on stop; kill first, then stop/reset.
+    systemctl kill -s TERM jack-watcher 2>/dev/null || true
+    sleep 0.2
+    systemctl kill -s KILL jack-watcher 2>/dev/null || true
+    systemctl stop jack-watcher 2>/dev/null || true
+    systemctl reset-failed jack-watcher 2>/dev/null || true
+  fi
+
+  # Also kill any ad-hoc runs by **name** (no -f)
+  pkill -x jack-watcher      2>/dev/null || true
+  pkill -x btn-watcher       2>/dev/null || true
+  pkill -x jack-watcher-run  2>/dev/null || true
+
+"'
+
+echo '>> Copying binaries atomically…'
+tmp_jw="$BIN_JW_REMOTE.new.$$"
+tmp_mc="$BIN_MC_REMOTE.new.$$"
+tmp_bw="$BIN_BW_REMOTE.new.$$"
+
+do_scp "$BIN_JW_LOCAL" "$tmp_jw"
+do_scp "$BIN_MC_LOCAL" "$tmp_mc"
+do_scp "$BIN_BW_LOCAL" "$tmp_bw"
+
+do_ssh "set -e
+  # Inject music dir and set modes on temp files
+  if grep -qE '^DIR=' '$tmp_mc' 2>/dev/null; then
+    sed -i -E 's|^DIR=.*$|DIR=\"$MUSIC_DIR\"|' '$tmp_mc'
+  else
+    printf '\nDIR=\"$MUSIC_DIR\"\n' >> '$tmp_mc'
+  fi
+  chmod 0755 '$tmp_jw' '$tmp_mc' '$tmp_bw'
+
+  # Rotate into place atomically
+  mv -f '$tmp_jw' '$BIN_JW_REMOTE'
+  mv -f '$tmp_mc' '$BIN_MC_REMOTE'
+  mv -f '$tmp_bw' '$BIN_BW_REMOTE'
+"
+do_ssh "chmod +x '$BIN_BW_REMOTE'"
+
 
 echo ">> Finalizing install on device…"
 do_ssh "set -e

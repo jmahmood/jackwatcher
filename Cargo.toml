@@ -6,3 +6,7 @@ edition = "2021"
 [dependencies]
 anyhow = "1"
 evdev = "0.12"
+
+[[bin]]
+name = "btn-watcher"
+path = "src/bin/btn-watcher.rs"

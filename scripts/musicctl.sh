@@ -6,6 +6,50 @@ PLAYLIST="$DIR/.playlist.m3u"
 PIDFILE="/run/musicctl.pid"
 KILL_THESE="retroarch emulationstation simplemenu gmu.bin"
 
+# inside musicctl (top)
+SOCK="/run/musicctl.sock"   # used when mpv is selected
+FIFO="/run/musicctl.fifo"   # used when mplayer is selected
+
+BTN_PID="/run/btn-watcher.pid"
+
+
+start_btn() {
+  # JW_CMD is already known (this script)
+  JW_CMD="$0" nohup /storage/bin/btn-watcher >/dev/null 2>&1 &
+  echo $! > "$BTN_PID"
+}
+
+stop_btn() {
+  if [ -f "$BTN_PID" ] && kill -0 "$(cat "$BTN_PID")" 2>/dev/null; then
+    kill -TERM "$(cat "$BTN_PID")" 2>/dev/null || true
+    rm -f "$BTN_PID"
+  else
+    pkill -TERM -f '/storage/bin/btn-watcher' 2>/dev/null || true
+  fi
+}
+
+
+next() {
+  if command -v mpv >/dev/null 2>&1; then
+    printf '{"command":["playlist-next"]}\n' | socat - UNIX-CONNECT:"$SOCK" 2>/dev/null || true
+  elif command -v mplayer >/dev/null 2>&1; then
+    echo "pt_step 1"  > "$FIFO" 2>/dev/null || true
+  else
+    # crude fallback: kill current player; your loop/playlist will advance
+    pkill -TERM mpv mplayer mpg123 ffplay 2>/dev/null || true
+  fi
+}
+prev() {
+  if command -v mpv >/dev/null 2>&1; then
+    printf '{"command":["playlist-prev"]}\n' | socat - UNIX-CONNECT:"$SOCK" 2>/dev/null || true
+  elif command -v mplayer >/dev/null 2>&1; then
+    echo "pt_step -1" > "$FIFO" 2>/dev/null || true
+  else
+    pkill -TERM mpv mplayer mpg123 ffplay 2>/dev/null || true
+  fi
+}
+
+
 make_playlist() {
   mkdir -p "$DIR" /run
   printf "#EXTM3U\n" >"$PLAYLIST"
@@ -35,11 +79,12 @@ start() {
 
   case "$(choose_player)" in
     mpv)
-      nohup mpv --no-video --really-quiet --shuffle --loop-playlist=inf --playlist="$PLAYLIST" \
+      rm -f "$SOCK"
+      nohup mpv --no-video --really-quiet --shuffle --loop-playlist=inf --playlist="$PLAYLIST" --input-ipc-server="$SOCK" \
         >/dev/null 2>&1 &
       ;;
     mplayer)
-      nohup mplayer -really-quiet -shuffle -loop 0 -playlist "$PLAYLIST" \
+      nohup mplayer -really-quiet -shuffle -loop 0 -playlist "$PLAYLIST" -slave -input file="$FIFO" \
         >/dev/null 2>&1 &
       ;;
     mpg123)
@@ -56,9 +101,12 @@ start() {
       ;;
   esac
   echo $! >"$PIDFILE"
+  start_btn
+
 }
 
 stop() {
+  stop_btn
   amixer sset 'Speaker' 80% unmute >/dev/null 2>&1 || true
   if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
     kill -TERM "$(cat "$PIDFILE")" 2>/dev/null || true
@@ -74,5 +122,7 @@ stop() {
 case "${1:-}" in
   start) start;;
   stop)  stop;;
-  *) echo "usage: $0 {start|stop}"; exit 2;;
+  next)  next;;
+  prev)  prev;;
+  *) echo "usage: $0 {start|stop|next|prev}"; exit 2;;
 esac
