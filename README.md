@@ -168,9 +168,9 @@ I want an appliance that I can plug into my speaker and not deal with
 
 I just want to plug and play with a device I already have.  The RG35XX Plus has a 3.5 mm plug, and when using evdev, we can detect if something is plugged into the device, be it a speaker system or a headset.
 
-## Why not GMU?
+## Why not use the GMU music player?
 
-GMU is included with Rocknix for the RG35XX Plus, but the controls don't work on the RG35XX Plus. Moreover, I can't seem to get it to load any playlist I set.  Seems like a bad idea honestly.
+GMU is included with Rocknix for the RG35XX Plus, but the controls don't work on the RG35XX Plus. Moreover, I can't seem to get it to load any playlist I set, and I can't quit the app once it starts.  Seems like a bad idea until that has been resolved.
 
 ## Why not use the /storage/roms/music directory?
 
