@@ -150,14 +150,27 @@ if ! do_ssh "command -v mpv >/dev/null 2>&1 || command -v mplayer >/dev/null 2>&
 fi
 
 if [ "$USE_SERVICE" -eq 1 ]; then
-  echo ">> Installing systemd service (best-effort)…"
-  SERVICE_CONTENT="[Unit]
+  echo ">> Installing service…"
+  UNIT_DIR=$(do_ssh 'if command -v systemctl >/dev/null 2>&1; then
+                       if [ -d /etc/systemd/system ] && [ -w /etc/systemd/system ]; then
+                         echo /etc/systemd/system
+                       else
+                         echo /storage/.config/system.d
+                       fi
+                     else
+                       echo NOSYSTEMD
+                     fi')
+
+  if [ "$UNIT_DIR" = "NOSYSTEMD" ]; then
+    echo "   Systemd not found; skipping service. Use $WRAPPER_REMOTE in autostart."
+  else
+    echo "   Using unit dir: $UNIT_DIR"
+    SERVICE_CONTENT="[Unit]
 Description=Headphone jack watcher
 After=multi-user.target
 
 [Service]
 Type=simple
-# Pin controller path via environment; wrapper is also available if you prefer
 Environment=JW_CMD=$BIN_MC_REMOTE
 ExecStart=$BIN_JW_REMOTE --watch --exec
 Restart=always
@@ -165,13 +178,17 @@ Restart=always
 [Install]
 WantedBy=multi-user.target
 "
-  do_ssh "bash -c 'cat >\"$UNIT_PATH\" <<EOF
+    do_ssh "mkdir -p '$UNIT_DIR'"
+    do_ssh "bash -c 'cat >\"$UNIT_DIR/jack-watcher.service\" <<EOF
 $SERVICE_CONTENT
 EOF
 systemctl daemon-reload || true
-systemctl enable --now jack-watcher || true
-true' " || echo "   (Could not install service; FS may be read-only. Use \"$WRAPPER_REMOTE\" in firmware autostart instead.)"
+systemctl enable --now jack-watcher || true'"
+
+    echo "   Verify: systemctl status jack-watcher"
+  fi
 fi
+
 
 echo ">> Smoke test:"
 do_ssh "$BIN_JW_REMOTE --list || true"

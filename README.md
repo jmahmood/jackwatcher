@@ -1,6 +1,7 @@
 # Jackwatcher
 
 A "plug and forget" Audio Player for ROCKNIX devices.
+
 Currently this only supports the RG35XX Plus.
 
 ## How does it work?
