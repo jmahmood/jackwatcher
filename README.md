@@ -144,7 +144,7 @@ ssh root@DEVICE_IP 'systemctl stop jack-watcher && systemctl disable jack-watche
 
 ## License
 
-Licensed under GPT3.  May consider dual licensing if it helps package the software if anyone ever wants to do so.
+Licensed under GPL3.  May consider dual licensing if it helps package the software if anyone ever wants to do so.
 
 ## “Can I run it from SD without systemd?”
 
