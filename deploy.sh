@@ -2,17 +2,19 @@
 set -euo pipefail
 
 # Defaults (overridable via flags or env)
-HOST=""                       # e.g. root@10.0.0.159
-PREFIX="${PREFIX:-/storage}"  # install root on the device
+HOST=""                                # e.g. root@10.0.0.159
+PREFIX="${PREFIX:-/storage}"           # install root on the device
 MUSIC_DIR="${MUSIC_DIR:-/storage/audio}"
-TARGET=""                     # auto-detected from remote uname -m unless set
+TARGET=""                               # auto-detected from remote uname -m unless set
 USE_SERVICE=0
 DRY_RUN=0
 SKIP_BUILD=0
+MAKE_COMPAT_SYMLINK=1                  # create /storage/musicctl.sh -> $BIN_MC_REMOTE
 BIN_JW_LOCAL="target/XXX/release/jack-watcher"  # resolved after target chosen
-BIN_MC_LOCAL="scripts/musicctl.sh"                 # your local musicctl; or embedded below
-BIN_JW_REMOTE=""                                # computed from $PREFIX
+BIN_MC_LOCAL="scripts/musicctl.sh"               # your local musicctl
+BIN_JW_REMOTE=""                        # computed from $PREFIX
 BIN_MC_REMOTE=""
+BIN_DIR=""
 SSH_OPTS=${SSH_OPTS:-}
 
 usage() {
@@ -28,6 +30,7 @@ Options:
   --dry-run              Print actions without executing
   --skip-build           Don't build (use existing local binaries)
   --ssh-opts "<opts>"    Extra SSH/SCP options (e.g., -i ~/.ssh/id_rsa -p 2222)
+  --no-compat-symlink    Do not create /storage/musicctl.sh symlink
   --uninstall            Remove installed files and (if present) systemd unit
   -h, --help             Show this help
 EOF
@@ -35,7 +38,7 @@ EOF
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 do_ssh() { [ "$DRY_RUN" -eq 1 ] && { echo "ssh $SSH_OPTS $HOST $*"; return; } ; ssh $SSH_OPTS "$HOST" "$@"; }
-do_scp()  { [ "$DRY_RUN" -eq 1 ] && { echo "scp $SSH_OPTS $1 $HOST:$2"; return; } ; scp $SSH_OPTS "$1" "$HOST:$2"; }
+do_scp() { [ "$DRY_RUN" -eq 1 ] && { echo "scp $SSH_OPTS $1 $HOST:$2"; return; } ; scp $SSH_OPTS "$1" "$HOST:$2"; }
 
 UNINSTALL=0
 while [ $# -gt 0 ]; do
@@ -48,6 +51,7 @@ while [ $# -gt 0 ]; do
     --dry-run) DRY_RUN=1; shift;;
     --skip-build) SKIP_BUILD=1; shift;;
     --ssh-opts) SSH_OPTS="$2"; shift 2;;
+    --no-compat-symlink) MAKE_COMPAT_SYMLINK=0; shift;;
     --uninstall) UNINSTALL=1; shift;;
     -h|--help) usage; exit 0;;
     *) die "Unknown arg: $1";;
@@ -58,17 +62,22 @@ done
 
 # Paths on device
 BIN_DIR="$PREFIX/bin"
-RUN_DIR="$PREFIX/run"   # for PID if you prefer under PREFIX (or keep /run)
 BIN_JW_REMOTE="$BIN_DIR/jack-watcher"
 BIN_MC_REMOTE="$BIN_DIR/musicctl"
+WRAPPER_REMOTE="$BIN_DIR/jack-watcher-run"
 UNIT_PATH="/etc/systemd/system/jack-watcher.service"
+COMPAT_SYMLINK="/storage/musicctl.sh"
 
 if [ "$UNINSTALL" -eq 1 ]; then
-  do_ssh "set -e; systemctl stop jack-watcher 2>/dev/null || true; systemctl disable jack-watcher 2>/dev/null || true; \
-          rm -f '$UNIT_PATH' 2>/dev/null || true; \
-          rm -f '$BIN_JW_REMOTE' '$BIN_MC_REMOTE' 2>/dev/null || true; \
-          echo 'Uninstalled jack-watcher and musicctl from $PREFIX/bin (if present).'; \
-          systemctl daemon-reload 2>/dev/null || true"
+  do_ssh "set -e
+    systemctl stop jack-watcher 2>/dev/null || true
+    systemctl disable jack-watcher 2>/dev/null || true
+    rm -f '$UNIT_PATH' 2>/dev/null || true
+    rm -f '$BIN_JW_REMOTE' '$BIN_MC_REMOTE' '$WRAPPER_REMOTE' 2>/dev/null || true
+    [ -L '$COMPAT_SYMLINK' ] && rm -f '$COMPAT_SYMLINK' || true
+    systemctl daemon-reload 2>/dev/null || true
+    echo 'Uninstalled jack-watcher, musicctl, wrapper, and unit (if present).'
+  "
   exit 0
 fi
 
@@ -81,7 +90,7 @@ if [ -z "$TARGET" ]; then
     aarch64) TARGET="aarch64-unknown-linux-gnu" ;;
     armv7l)  TARGET="armv7-unknown-linux-gnueabihf" ;;
     armhf)   TARGET="arm-unknown-linux-gnueabihf" ;;
-    *) die "Unsupported remote arch '$REMOTE_UNAME'. Use --target to override."; ;;
+    *) die "Unsupported remote arch '$REMOTE_UNAME'. Use --target to override." ;;
   esac
 fi
 echo "   build target: $TARGET"
@@ -93,7 +102,6 @@ if [ "$SKIP_BUILD" -eq 0 ]; then
   if command -v cross >/dev/null 2>&1; then
     CMD="cross build --release --target $TARGET"
   else
-    # ensure target is available
     rustup target add "$TARGET" >/dev/null 2>&1 || true
     CMD="cargo build --release --target $TARGET"
   fi
@@ -102,20 +110,44 @@ if [ "$SKIP_BUILD" -eq 0 ]; then
 fi
 
 [ -f "$BIN_JW_LOCAL" ] || die "Local binary not found: $BIN_JW_LOCAL (did build succeed?)"
+[ -f "$BIN_MC_LOCAL" ] || die "Local controller script not found: $BIN_MC_LOCAL"
 
 echo ">> Creating install dirs on device ($BIN_DIR)…"
-do_ssh "mkdir -p '$BIN_DIR' '$RUN_DIR'"
+do_ssh "mkdir -p '$BIN_DIR'"
 
-echo ">> Copying binaries…"
+echo '>> Copying binaries…'
 do_scp "$BIN_JW_LOCAL" "$BIN_JW_REMOTE"
 do_scp "$BIN_MC_LOCAL" "$BIN_MC_REMOTE"
 
 echo ">> Finalizing install on device…"
-# Inject MUSIC_DIR default into musicctl and set modes
 do_ssh "set -e
-  sed -i \"s|^DIR=\"\\\${MUSIC_DIR:-/storage/audio}\"|DIR=\"$MUSIC_DIR\"|\" '$BIN_MC_REMOTE' || true
+  # Ensure controller uses the desired music dir
+  if grep -qE '^DIR=' '$BIN_MC_REMOTE' 2>/dev/null; then
+    sed -i -E 's|^DIR=.*$|DIR=\"$MUSIC_DIR\"|' '$BIN_MC_REMOTE'
+  else
+    printf '\nDIR=\"$MUSIC_DIR\"\n' >> '$BIN_MC_REMOTE'
+  fi
   chmod +x '$BIN_JW_REMOTE' '$BIN_MC_REMOTE'
+
+  # Create wrapper that pins JW_CMD to the installed controller
+  cat > '$WRAPPER_REMOTE' <<WRAP
+#!/bin/sh
+export JW_CMD=\"$BIN_MC_REMOTE\"
+exec \"$BIN_JW_REMOTE\" --watch --exec "\$@"
+WRAP
+  chmod +x '$WRAPPER_REMOTE'
+
+  # Optional compatibility symlink for older builds that expect /storage/musicctl.sh
+  if [ $MAKE_COMPAT_SYMLINK -eq 1 ]; then
+    ln -sf '$BIN_MC_REMOTE' '$COMPAT_SYMLINK' 2>/dev/null || true
+  fi
 "
+
+# Warn if no player present on the device
+echo ">> Checking for available players on device…"
+if ! do_ssh "command -v mpv >/dev/null 2>&1 || command -v mplayer >/dev/null 2>&1 || command -v mpg123 >/dev/null 2>&1 || command -v ffplay >/dev/null 2>&1"; then
+  echo "   WARNING: No mpv/mplayer/mpg123/ffplay found on device; musicctl will print 'no player found'."
+fi
 
 if [ "$USE_SERVICE" -eq 1 ]; then
   echo ">> Installing systemd service (best-effort)…"
@@ -125,27 +157,30 @@ After=multi-user.target
 
 [Service]
 Type=simple
+# Pin controller path via environment; wrapper is also available if you prefer
+Environment=JW_CMD=$BIN_MC_REMOTE
 ExecStart=$BIN_JW_REMOTE --watch --exec
 Restart=always
 
 [Install]
 WantedBy=multi-user.target
 "
-  # Try to write unit (may fail on read-only /etc; that's OK)
   do_ssh "bash -c 'cat >\"$UNIT_PATH\" <<EOF
 $SERVICE_CONTENT
 EOF
 systemctl daemon-reload || true
 systemctl enable --now jack-watcher || true
-true' " || echo "   (Could not install service; filesystem may be read-only. You can run '$BIN_JW_REMOTE --watch --exec' via your firmware's autostart instead.)"
+true' " || echo "   (Could not install service; FS may be read-only. Use \"$WRAPPER_REMOTE\" in firmware autostart instead.)"
 fi
 
 echo ">> Smoke test:"
 do_ssh "$BIN_JW_REMOTE --list || true"
 
 echo ">> Done.
-- jack-watcher: $BIN_JW_REMOTE
-- musicctl:     $BIN_MC_REMOTE
-- music dir:    $MUSIC_DIR
-$( [ $USE_SERVICE -eq 1 ] && echo '- systemd:     installed (if supported)' || echo '- systemd:     skipped' )
+- jack-watcher:     $BIN_JW_REMOTE
+- musicctl:         $BIN_MC_REMOTE
+- wrapper (run me): $WRAPPER_REMOTE
+- music dir:        $MUSIC_DIR
+$( [ $USE_SERVICE -eq 1 ] && echo '- systemd:          installed (if supported)' || echo '- systemd:          skipped' )
+$( [ $MAKE_COMPAT_SYMLINK -eq 1 ] && echo '- compat symlink:   /storage/musicctl.sh -> musicctl' || echo '- compat symlink:   disabled' )
 "

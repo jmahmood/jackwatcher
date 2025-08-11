@@ -2,18 +2,6 @@ use anyhow::Result;
 use evdev::{enumerate, Device, SwitchType};
 use std::{env, path::PathBuf, process::Command, thread};
 
-const START_CMD: &[&str] = &[
-    "/storage/musicctl.sh",
-    "start",
-];
-
-const STOP_CMD:  &[&str] = &[
-	"/storage/musicctl.sh",
-    "stop",
-];
-
-
-
 fn supported_hp(dev: &Device) -> bool {
     dev.supported_switches()
         .map(|s| s.contains(SwitchType::SW_HEADPHONE_INSERT))
@@ -21,15 +9,57 @@ fn supported_hp(dev: &Device) -> bool {
 }
 
 fn current_hp(dev: &Device) -> Option<bool> {
-    match dev.get_switch_state() {
-        Ok(state) => Some(state.contains(SwitchType::SW_HEADPHONE_INSERT)),
-        Err(_) => None,
-    }
+    dev.get_switch_state()
+        .ok()
+        .map(|s| s.contains(SwitchType::SW_HEADPHONE_INSERT))
 }
 
-fn run_cmd(cmd: &[&str]) {
-    eprintln!("[exec] {:?} {:?}", cmd[0], &cmd[1..]);
-    let _ = Command::new(cmd[0]).args(&cmd[1..]).status();
+#[derive(Clone)]
+struct Cfg {
+    controller: String, // e.g. "/storage/bin/musicctl"
+    do_exec: bool,
+    fire_initial: bool,
+}
+
+fn resolve_cfg(args: impl Iterator<Item=String>) -> (Option<String>, Cfg) {
+    // parse: --list | --watch [--exec] [--fire-initial] [--cmd <path>]
+    let mut mode_list = false;
+    let mut do_exec = false;
+    let mut fire_initial = false;
+    let mut cmd_cli: Option<String> = None;
+
+    let mut it = args.peekable();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--list" => mode_list = true,
+            "--watch" => {} // default
+            "--exec" => do_exec = true,
+            "--fire-initial" => fire_initial = true,
+            "--cmd" => {
+                cmd_cli = it.next();
+                if cmd_cli.is_none() {
+                    eprintln!("--cmd requires a path"); std::process::exit(2);
+                }
+            }
+            _ => {
+                eprintln!("Usage: jack-watcher [--watch] [--exec] [--fire-initial] [--cmd <controller_path>]");
+                eprintln!("       jack-watcher --list");
+                std::process::exit(2);
+            }
+        }
+    }
+
+    let controller = cmd_cli
+        .or_else(|| env::var("JW_CMD").ok())
+        .unwrap_or_else(|| "/storage/musicctl.sh".to_string());
+
+    let cfg = Cfg { controller, do_exec, fire_initial };
+    (mode_list.then_some("--list".to_string()), cfg)
+}
+
+fn run_controller(controller: &str, action: &str) {
+    eprintln!("[exec] {} {}", controller, action);
+    let _ = Command::new(controller).arg(action).status();
 }
 
 fn list_nodes() -> Result<()> {
@@ -43,7 +73,7 @@ fn list_nodes() -> Result<()> {
     Ok(())
 }
 
-fn watch_all(do_exec: bool, fire_initial: bool) -> Result<()> {
+fn watch_all(cfg: Cfg) -> Result<()> {
     // Collect devices that expose the headphone switch
     let mut nodes: Vec<(PathBuf, Device)> = enumerate()
         .filter(|(_, d)| supported_hp(d))
@@ -61,81 +91,58 @@ fn watch_all(do_exec: bool, fire_initial: bool) -> Result<()> {
         eprintln!("  - {} ({name}) initial HEADPHONE_INSERT={}", p.display(), if init {1} else {0});
     }
 
-	// Spawn a blocking loop per device (no polling)
-    // Evdev is blocking by default.
-	for (path, mut dev) in nodes.drain(..) {
-	    let name = dev.name().unwrap_or("<unknown>").to_string();
+    // Blocking loop per device
+    for (path, mut dev) in nodes.drain(..) {
+        let name = dev.name().unwrap_or("<unknown>").to_string();
+        let controller = cfg.controller.clone();
+        let do_exec = cfg.do_exec;
+        let mut last = current_hp(&dev);
 
-	    // Seed last from current state (edge-trigger)
-	    let mut last = current_hp(&dev);
+        if cfg.fire_initial {
+            if let Some(true) = last {
+                eprintln!("[event] {} ({}) initial START (fire-initial)", path.display(), name);
+                if do_exec { run_controller(&controller, "start"); }
+            }
+        }
 
-	    if fire_initial {
-	        if let Some(true) = last {
-	            eprintln!("[event] {} ({}) initial START (fire-initial)", path.display(), name);
-	            if do_exec { run_cmd(START_CMD); }
-	        }
-	    }
+        thread::spawn(move || {
+            loop {
+                match dev.fetch_events() {
+                    Ok(events) => {
+                        for ev in events {
+                            if let evdev::InputEventKind::Switch(evdev::SwitchType::SW_HEADPHONE_INSERT) = ev.kind() {
+                                let plugged = ev.value() != 0;
+                                if last.map(|p| p != plugged).unwrap_or(true) {
+                                    eprintln!(
+                                        "[event] {} ({}) HEADPHONE_INSERT={} -> {}",
+                                        path.display(), name,
+                                        if plugged {1} else {0},
+                                        if plugged {"START"} else {"STOP"}
+                                    );
+                                    last = Some(plugged);
+                                    if do_exec {
+                                        if plugged { run_controller(&controller, "start"); }
+                                        else       { run_controller(&controller, "stop");  }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Err(_e) => {
+                        // Rare transient; brief backoff to avoid a tight loop
+                        std::thread::sleep(std::time::Duration::from_millis(200));
+                    }
+                }
+            }
+        });
+    }
 
-
-	    thread::spawn(move || {
-	        loop {
-	            match dev.fetch_events() {
-	                Ok(events) => {
-	                    for ev in events {
-	                        if let evdev::InputEventKind::Switch(evdev::SwitchType::SW_HEADPHONE_INSERT) = ev.kind() {
-	                            let plugged = ev.value() != 0;
-	                            if last.map(|p| p != plugged).unwrap_or(true) {
-	                                eprintln!(
-	                                    "[event] {} ({}) HEADPHONE_INSERT={} -> {}",
-	                                    path.display(), name,
-	                                    if plugged {1} else {0},
-	                                    if plugged {"START"} else {"STOP"}
-	                                );
-	                                last = Some(plugged);
-	                                if do_exec {
-	                                    if plugged { run_cmd(START_CMD); } else { run_cmd(STOP_CMD); }
-	                                }
-	                            }
-	                        }
-	                    }
-	                }
-	                Err(_e) => {
-	                    // Rare read error (e.g., device transient). Brief backoff to avoid spin.
-	                    std::thread::sleep(std::time::Duration::from_millis(200));
-	                }
-	            }
-	        }
-	    });
-	}
-
-    // Keep foreground process alive so you can watch logs
+    // Keep foreground process alive
     loop { thread::park(); }
 }
 
 fn main() -> Result<()> {
-    let mut args = env::args().skip(1);
-    match args.next().as_deref() {
-        Some("--list") => list_nodes(),
-        Some("--watch") | None => {
-            let mut do_exec = false;
-            let mut fire_initial = false;
-            for a in args {
-                match a.as_str() {
-                    "--exec" => do_exec = true,
-                    "--fire-initial" => fire_initial = true,
-                    _ => {
-                        eprintln!("Usage: jack-watcher [--watch] [--exec] [--fire-initial]");
-                        eprintln!("       jack-watcher --list");
-                        std::process::exit(2);
-                    }
-                }
-            }
-            watch_all(do_exec, fire_initial)
-        }
-        Some(_) => {
-            eprintln!("Usage: jack-watcher [--watch] [--exec] [--fire-initial]");
-            eprintln!("       jack-watcher --list");
-            std::process::exit(2);
-        }
-    }
+    let (mode, cfg) = resolve_cfg(env::args().skip(1));
+    if mode.is_some() { return list_nodes(); }
+    watch_all(cfg)
 }
