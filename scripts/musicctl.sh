@@ -12,6 +12,30 @@ FIFO="/run/musicctl.fifo"   # used when mplayer is selected
 
 BTN_PID="/run/btn-watcher.pid"
 
+seek_generic() {
+  # $1 like +5 or -30
+  [ -n "${1:-}" ] || { echo "musicctl: seek requires +/-seconds"; return 2; }
+  local secs="$1"
+
+  case "$(choose_player)" in
+    mpv)
+      # JSON numbers cannot have a leading '+'
+      local jsecs="${secs#+}"
+      printf '{"command":["seek",%s,"relative"]}\n' "$jsecs" \
+        | socat - UNIX-CONNECT:"$SOCK" 2>/dev/null || true
+      ;;
+    mplayer)
+      # mplayer expects a plain integer (no '+') anyway
+      secs="${secs#+}"
+      echo "seek $secs 0" > "$FIFO" 2>/dev/null || true
+      ;;
+    *)
+      :
+      ;;
+  esac
+}
+
+
 
 start_btn() {
   # JW_CMD is already known (this script)
@@ -124,5 +148,6 @@ case "${1:-}" in
   stop)  stop;;
   next)  next;;
   prev)  prev;;
-  *) echo "usage: $0 {start|stop|next|prev}"; exit 2;;
+  seek)  shift; seek_generic "${1:-}";;
+  *) echo "usage: $0 {start|stop|next|prev|seek +/-secs}"; exit 2;;
 esac
