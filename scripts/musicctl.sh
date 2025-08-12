@@ -10,9 +10,59 @@ KILL_THESE="retroarch emulationstation simplemenu gmu.bin"
 SOCK="/run/musicctl.sock"   # used when mpv is selected
 FIFO="/run/musicctl.fifo"   # used when mplayer is selected
 RESUME_DB="${RESUME_DB:-/storage/jackwatcher/resume.db}"
+LAST_FILE="${LAST_FILE:-/storage/jackwatcher/last.txt}"
 MPVLOG_PID="/run/mpvlog.pid"
 
 BTN_PID="/run/btn-watcher.pid"
+
+LOG="${LOG:-/storage/jw.start.log}"
+
+log() {
+  # timestamped single-line log
+  printf '%s %s\n' "$(date +'%F %T')" "$*" >> "$LOG"
+}
+
+# Query current playback position (seconds, float). Returns empty if unavailable.
+mpv_get_timepos() {
+  local out pos i=0
+  while [ $i -lt 10 ]; do
+    out=$(printf '%s\n' '{"command":["get_property","time-pos"]}' | mpv_ipc) || out=""
+    pos=$(printf '%s' "$out" | sed -n 's/.*"data":\([0-9.]\+\).*/\1/p')
+    [ -n "$pos" ] && { printf '%s\n' "$pos"; return 0; }
+    sleep 0.05; i=$((i+1))
+  done
+  return 1
+}
+
+# Write last.txt as: <path>\t<pos>
+write_last() {
+  # $1=abs path, $2=pos float
+  [ -n "${1:-}" ] && [ -n "${2:-}" ] || return 1
+  mkdir -p "$(dirname "$LAST_FILE")" 2>/dev/null || true
+  # Use printf to ensure TAB and newline are correct
+  printf '%s\t%s\n' "$1" "$2" > "$LAST_FILE"
+}
+
+
+# Wait until the IPC socket accepts and mpv replies to a trivial query
+wait_ipc_ready() {
+  local i=0 out
+  while [ $i -lt 50 ]; do   # ~5s max
+    out=$(printf '%s\n' '{"command":["get_property","mpv-version"]}' | mpv_ipc) || out=""
+    echo "$out" | grep -q '"error":"success"' && return 0
+    sleep 0.1; i=$((i+1))
+  done
+  return 1
+}
+
+mpv_ipc_json() {
+  # log the exact JSON we send over IPC, then send it
+  # usage: mpv_ipc_json '{"command":["playlist-next"]}'
+  local json="$1"
+  log "ipc -> $json"
+  printf '%s\n' "$json" | mpv_ipc >/dev/null 2>&1
+}
+
 
 mpv_ipc() { socat - UNIX-CONNECT:"$SOCK" 2>/dev/null; }
 # get current path from mpv; retries for up to ~2s
@@ -38,8 +88,31 @@ seek() {
     mpv)
       # JSON numbers cannot have a leading '+'
       local jsecs="${secs#+}"
-      printf '{"command":["seek",%s,"relative"]}\n' "$jsecs" \
-        | socat - UNIX-CONNECT:"$SOCK" 2>/dev/null || true
+
+      # Get current path and pre-seek position (best-effort)
+      local cur_path cur_before cur_after
+      cur_path="$(mpv_get_path 2>/dev/null || true)"
+      cur_before="$(mpv_get_timepos 2>/dev/null || true)"
+
+      # Issue the seek (relative)
+      printf '{"command":["seek",%s,"relative"]}\n' "$jsecs" | mpv_ipc >/dev/null 2>&1 || true
+
+      # Give mpv a moment to apply, then read the *actual* position
+      sleep 0.05
+      cur_after="$(mpv_get_timepos 2>/dev/null || true)"
+
+      # If we have a path and a position, persist immediately
+      if [ -n "$cur_path" ] && [ -n "$cur_after" ]; then
+        write_last "$cur_path" "$cur_after"
+      elif [ -n "$cur_path" ] && [ -n "$cur_before" ]; then
+        # Fallback: compute (clamped) if post-read failed
+        # Note: no duration clamp here; mpv will clamp internally on next update
+        # Remove '+' if present and do a simple shell addition via awk
+        local delta="${jsecs#+}"
+        local est
+        est="$(awk -v a="$cur_before" -v d="$delta" 'BEGIN{printf("%.3f", a + d)}')"
+        write_last "$cur_path" "$est"
+      fi
       ;;
     mplayer)
       # mplayer expects a plain integer (no '+') anyway
@@ -112,6 +185,12 @@ choose_player() {
   echo none
 }
 
+read_last() {
+  # prints "path<TAB>pos" if present
+  [ -f "$LAST_FILE" ] || return 1
+  awk -F '\t' 'NR==1{print $1 "\t" $2}' "$LAST_FILE"
+}
+
 start() {
   make_playlist
 
@@ -127,11 +206,57 @@ start() {
   case "$(choose_player)" in
     mpv)
       rm -f "$SOCK"
-      nohup mpv --no-video --really-quiet --shuffle --loop-playlist=inf --playlist="$PLAYLIST" --input-ipc-server="$SOCK" \
-        >/dev/null 2>&1 &
-      MPV_SOCKET="$SOCK" JW_RESUME_DB="$RESUME_DB" \
-        nohup /storage/bin/mpvlog >/dev/null 2>&1 & echo $! > "$MPVLOG_PID"
+
+      # Phase 1: start mpv idle (no playlist yet → nothing races us)
+      MPV_CMD='mpv --no-video --really-quiet --idle=yes --loop-playlist=inf --input-ipc-server="'"$SOCK"'"'
+      # (loop-playlist stays enabled; list will be appended in phase 2)
+      log "exec: $MPV_CMD"
+      nohup sh -c "$MPV_CMD" >/dev/null 2>&1 &
+
+      # Ensure IPC is responsive
+      log "waiting for IPC readiness"
+      if ! wait_ipc_ready; then
+        log "IPC not ready; continuing anyway"
+      fi
+
+      # Phase 2: authoritative resume, then enqueue & shuffle playlist
+      if [ -f "$LAST_FILE" ]; then
+        last_path="$(awk -F '\t' 'NR==1{print $1}' "$LAST_FILE")"
+        last_pos="$(awk -F '\t' 'NR==1{print $2}' "$LAST_FILE")"
+        log "last.txt parsed: path='${last_path:-}' pos='${last_pos:-}'"
+        if [ -n "${last_path:-}" ] && [ -n "${last_pos:-}" ] && [ -f "$last_path" ]; then
+          json=$(printf '{"command":["loadfile","%s","replace","start=%s"]}' "$last_path" "$last_pos")
+          log "ipc -> $json"
+          printf '%s\n' "$json" | mpv_ipc >/dev/null 2>&1
+          log "RESUME(last) path=$last_path pos=$last_pos"
+        else
+          log "last.txt unusable (missing/invalid or file not found)"
+        fi
+      else
+        log "no last.txt present"
+      fi
+
+      # Append playlist and shuffle (current playing entry stays as-is)
+      json=$(printf '{"command":["loadlist","%s","append"]}' "$PLAYLIST")
+      log "ipc -> $json"
+      printf '%s\n' "$json" | mpv_ipc >/dev/null 2>&1
+
+      json='{"command":["playlist-shuffle"]}'
+      log "ipc -> '"$json"'"
+      printf '%s\n' "$json" | mpv_ipc >/dev/null 2>&1
+
+      # Start logger
+
+      log "starting mpvlog env: MPV_SOCKET='$SOCK' JW_RESUME_DB='$RESUME_DB' JW_LAST_FILE='$LAST_FILE'"
+      MPV_SOCKET="$SOCK" JW_RESUME_DB="$RESUME_DB" JW_LAST_FILE="$LAST_FILE" JW_DEBUG=1 \
+        nohup /storage/bin/mpvlog >/storage/jw.mpvlog.log 2>&1 & echo $! > "$MPVLOG_PID"
+
+      sleep 1
+      if ! kill -0 "$(cat "$MPVLOG_PID" 2>/dev/null)" 2>/dev/null; then
+        log "ERROR: mpvlog failed to start; see /storage/jw.mpvlog.log"
+      fi
       ;;
+
 
     mplayer)
       nohup mplayer -really-quiet -shuffle -loop 0 -playlist "$PLAYLIST" -slave -input file="$FIFO" \
