@@ -68,6 +68,7 @@ BIN_DIR="$PREFIX/bin"
 BIN_JW_REMOTE="$BIN_DIR/jack-watcher"
 BIN_MC_REMOTE="$BIN_DIR/musicctl"
 BIN_BW_REMOTE="$BIN_DIR/btn-watcher"
+BIN_MPVLOG_REMOTE="$BIN_DIR/mpvlog"
 WRAPPER_REMOTE="$BIN_DIR/jack-watcher-run"
 UNIT_PATH="/etc/systemd/system/jack-watcher.service"
 COMPAT_SYMLINK="/storage/musicctl.sh"
@@ -101,6 +102,8 @@ echo "   build target: $TARGET"
 
 BIN_JW_LOCAL="target/$TARGET/release/jack-watcher"
 BIN_BW_LOCAL="target/$TARGET/release/btn-watcher"
+BIN_MPVLOG_LOCAL="target/$TARGET/release/mpvlog"
+
 
 
 if [ "$SKIP_BUILD" -eq 0 ]; then
@@ -148,6 +151,9 @@ tmp_bw="$BIN_BW_REMOTE.new.$$"
 do_scp "$BIN_JW_LOCAL" "$tmp_jw"
 do_scp "$BIN_MC_LOCAL" "$tmp_mc"
 do_scp "$BIN_BW_LOCAL" "$tmp_bw"
+do_scp "$BIN_MPVLOG_LOCAL" "$BIN_MPVLOG_REMOTE"
+do_ssh "chmod +x '$BIN_MPVLOG_REMOTE'"
+do_ssh "mkdir -p /storage/jackwatcher"
 
 do_ssh "set -e
   # Inject music dir and set modes on temp files

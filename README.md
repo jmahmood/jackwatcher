@@ -6,22 +6,23 @@ Currently this only supports the RG35XX Plus.
 
 ## How does it work?
 
-"Jack Watcher" is a background process that blocks and waits for a headphone insertion event.  If it finds one, it immediately triggers the musicctl.sh script, which then plays audio files in a pre-determined directory.
+Jackwatcher is a “plug-and-forget” audio player daemon for ROCKNIX devices (currently RG35XX Plus only).
 
-It currently runs as root, as it assumes access to `/dev/input/event`.  As such it is NOT suitable for use on a device with sensitive information.  
+It waits for a 3.5 mm headphone jack insertion event, then runs a configurable player (musicctl) to play audio from a specified directory. While running, a companion btn-watcher process listens for controller input: LB/RB skip tracks, D-Pad seeks forward/backward. 
 
-The event reads are blocking, so idle CPU is effectively 0%.
+Event reads are blocking, so idle CPU is effectively 0%.
+
+## Security Note
+
+Jackwatcher currently runs as root, as it assumes access to `/dev/input/event`.  As such it is NOT suitable for use on a device with sensitive information.  
+
 
 ## Prereqs
 
-* A ROCKNIX build on an **RG35XX Plus** (root SSH access).
-* On your dev machine: Rust toolchain + optionally `cross`.
-* On the device: at least **one** of `mpv`, `mplayer`, `mpg123`, or `ffplay` available in `$PATH`.
-
-  ```sh
-  which mpv mplayer mpg123 ffplay | cat
-  ```
-* Audio files under `/storage/audio` (default) or whatever you pass to `deploy.sh --music-dir`.
+- A ROCKNIX build on an **RG35XX Plus** (root SSH access).
+- On your dev machine: Rust toolchain + optionally `cross`.
+- On the device: at least **one** of `mpv`, `mplayer`, `mpg123`, or `ffplay` available in `$PATH`.  (MPV is built into the current version of ROCKNIX)
+- Audio files under `/storage/audio` (default) or whatever you pass to `deploy.sh --music-dir`.
 
 ## Quickstart
 
@@ -31,12 +32,6 @@ There is a deploy.sh file that ChatGPT kindly prepared for me.  As long as you h
 # From your dev linux machine
 
 $ ./deploy.sh --host root@10.0.0.159
-
-# Optional flags:
-./deploy.sh --host root@DEVICE_IP --music-dir /storage/podcasts     # change source dir
-./deploy.sh --host root@DEVICE_IP --prefix /storage                  # change install prefix
-./deploy.sh --host root@DEVICE_IP --dry-run                          # show what would happen
-./deploy.sh --host root@DEVICE_IP --skip-build                       # reuse existing local build
 ```
 
 The wrapper `/storage/bin/jack-watcher-run` pins JW_CMD=/storage/bin/musicctl and runs --watch --exec, so you don’t need to pass paths.
@@ -63,6 +58,13 @@ Optional service (if your image supports it):
 
 If you want to install manually, you can copy the files over to the memory card, but I'm too lazy to figure that out, sorry.
 
+*Optional flags*
+
+--music-dir:  change source dir
+--prefix /storage: change install prefix
+--dry-run: show what would happen
+--skip-build: reuse existing local build
+
 
 ## Verify it’s wired correctly
 
@@ -84,21 +86,14 @@ Foreground watch with logs:
 
 ## Configuration knobs
 
-* **Music directory:** set with deploy flag:
+| Option                  | How to set                                       | Default                              |
+| ----------------------- | ------------------------------------------------ | ------------------------------------ |
+| Music directory         | `--music-dir`                                    | `/storage/audio`                     |
+| Player                  | First found in `mpv → mplayer → mpg123 → ffplay` | mpv                                  |
+| Skip apps when starting | Edit `KILL_THESE` in `musicctl`                  | `retroarch emulationstation gmu.bin` |
+| Small seek              | `JW_SEEK_SMALL` env var                          | `5` seconds                          |
+| Large seek              | `JW_SEEK_BIG` env var                            | `30` seconds                         |
 
-  ```bash
-  ./deploy.sh --host root@DEVICE_IP --music-dir /storage/podcasts
-  ```
-
-  (Installer rewrites `musicctl`’s `DIR=…` line.)
-* **Controller path:** the watcher honors `JW_CMD` env or `--cmd`, but the wrapper already sets:
-
-  ```sh
-  export JW_CMD="/storage/bin/musicctl"
-  ```
-* **Player selection/order:** `musicctl` auto-selects the first present in `mpv → mplayer → mpg123 → ffplay`. Edit the script if you want a fixed one.
-* **Front-ends to kill on start:** tweak `KILL_THESE` in `musicctl` (e.g., `retroarch emulationstation gmu.bin`).
-* **Mixer routing:** `musicctl` nudges `Headphone`/`Speaker` via `amixer`. If your mixer names differ, edit the two amixer lines in musicctl to match your controls (e.g., Headphone/Speaker → your codec’s names).
 
 ## Uninstall
 
@@ -112,11 +107,11 @@ This also removes the wrapper and systemd unit (if present). To stop a service w
 ssh root@DEVICE_IP 'systemctl stop jack-watcher && systemctl disable jack-watcher'
 ```
 
-## Known limitations / roadmap
+## TODO
 
-* Currently reacts only to **headphone jack insert/remove** (no hotkeys for skip/pause yet).
-* Resume position/artwork not implemented (see TODO).
-* Requires at least one CLI player present on the device.
+* Add hotkeys for pause.  (You can use `RB`, `LB` to move between files, and the D-Pad to seek within a file)
+* Resume position/artwork not implemented.
+* Find an alternative to running as root.  (This is the norm on Rocknix but still feels wrong)
 
 
 ## Troubleshooting

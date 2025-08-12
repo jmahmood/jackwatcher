@@ -6,7 +6,13 @@ edition = "2021"
 [dependencies]
 anyhow = "1"
 evdev = "0.12"
+serde_json = "1"
 
 [[bin]]
 name = "btn-watcher"
 path = "src/bin/btn-watcher.rs"
+
+[[bin]]
+name = "mpvlog"
+path = "src/bin/mpvlog.rs"
+
