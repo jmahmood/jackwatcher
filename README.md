@@ -109,6 +109,7 @@ ssh root@DEVICE_IP 'systemctl stop jack-watcher && systemctl disable jack-watche
 
 ## TODO
 
+* Enable power saving.  We don't need the screen on while playing music, unless the user hits a button.
 * Add hotkeys for pause.  (You can use `RB`, `LB` to move between files, and the D-Pad to seek within a file)
 * Resume position/artwork not implemented.
 * Find an alternative to running as root.  (This is the norm on Rocknix but still feels wrong)
@@ -172,9 +173,9 @@ GMU is included with Rocknix for the RG35XX Plus, but the controls don't work on
 
 I assume users will want to have a different directory for auto-played audio.  Maybe you have an audio book you want to play, or a podcast queue that you do not want as BGM.  You can link the directories if you want to keep them the same.
 
-## What if I want to select my music?
+## What if I want to select what music to play?
 
-Use something else.  This is meant to be a "plug and forget" style system.
+You can use LB/RB to switch songs.  However, this application purposely exposes no GUI.  If you need one, please consider something else.  This is meant to be a "plug and forget" style system.
 
 ## Why not bluetooth?
 
